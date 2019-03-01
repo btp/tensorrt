@@ -30,6 +30,11 @@ import tensorflow.contrib.slim as slim
 import official.resnet.imagenet_main
 from preprocessing import inception_preprocessing, vgg_preprocessing
 
+# Create a hook to MonitoredSession.run() that keeps track of the running time
+# of each step.  Use the `batch_size' (number of images per batch) and
+# `num_records' (total number of TFRecords) parameters to determine the total
+# number of steps.  Use the `display_every' parameter to set the number of
+# iterations between two successive displays of metrics.
 class LoggerHook(tf.train.SessionRunHook):
     """Logs runtime of each iteration"""
     def __init__(self, batch_size, num_records, display_every):
@@ -52,6 +57,8 @@ class LoggerHook(tf.train.SessionRunHook):
                 current_step, self.num_steps, duration * 1000,
                 self.batch_size / self.iter_times[-1]))
 
+# Create a hook to MonitoredSession.run() that limits the time that the script
+# runs to the number of seconds defined by the `target_duration' parameter.
 class DurationHook(tf.train.SessionRunHook):
     """Limits run duration"""
     def __init__(self, target_duration):
@@ -81,13 +88,17 @@ def run(frozen_graph, model, data_files, batch_size,
     tf.estimator.Estimator is used to evaluate the accuracy of the model
     and a few other metrics. The results are returned as a dict.
 
-    frozen_graph: GraphDef, a graph containing input node 'input' and outputs 'logits' and 'classes'
+    frozen_graph: GraphDef, a graph containing input node 'input' and outputs
+    'logits' and 'classes'
     model: string, the model name (see NETS table in graph.py)
     data_files: List of TFRecord files used for inference
     batch_size: int, batch size for TensorRT optimizations
     num_iterations: int, number of iterations(batches) to run for
+
     """
-    # Define model function for tf.estimator.Estimator
+    # Define a model function for tf.estimator.Estimator.  Calculate loss as
+    # sparse softmax cross entropy between `logits' and `labels'.  Keep track of
+    # accuracy metrics under the variable scope `acc_op'.
     def model_fn(features, labels, mode):
         logits_out, classes_out = tf.import_graph_def(frozen_graph,
             input_map={'input': features},
@@ -572,7 +583,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_iterations', type=int, default=None,
         help='How many iterations(batches) to evaluate. If not supplied, the whole set will be evaluated.')
     parser.add_argument('--display_every', type=int, default=100,
-        help='Number of iterations executed between two consecutive display of metrics')
+        help='Number of iterations executed between two consecutive displays of metrics')
     parser.add_argument('--use_synthetic', action='store_true',
         help='If set, one batch of random data is generated and used at every iteration.')
     parser.add_argument('--num_warmup_iterations', type=int, default=50,
