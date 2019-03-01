@@ -30,6 +30,11 @@ import tensorflow.contrib.slim as slim
 import official.resnet.imagenet_main
 from preprocessing import inception_preprocessing, vgg_preprocessing
 
+# Create a hook to MonitoredSession.run() that keeps track of the running time
+# of each step.  Use the `batch_size' (number of images per batch) and
+# `num_records' (total number of TFRecords) parameters to determine the total
+# number of steps.  Use the `display_every' parameter to set the number of
+# iterations between two successive displays of metrics.
 class LoggerHook(tf.train.SessionRunHook):
     """Logs runtime of each iteration"""
     def __init__(self, batch_size, num_records, display_every):
@@ -52,6 +57,10 @@ class LoggerHook(tf.train.SessionRunHook):
                 current_step, self.num_steps, duration * 1000,
                 self.batch_size / self.iter_times[-1]))
 
+# Create a hook to MonitoredSession.run() that limits the time and the number of
+# iterations that the script runs.  The time is limited to the number of seconds
+# defined by the `target_duration' parameter, and the number of iterations is
+# limited to that defined by the `iteration_limit' parameter.
 class BenchmarkHook(tf.train.SessionRunHook):
     """Limits run duration and number of iterations"""
     def __init__(self, target_duration=None, iteration_limit=None):
@@ -86,19 +95,24 @@ def run(frozen_graph, model, data_files, batch_size,
     tf.estimator.Estimator is used to evaluate the accuracy of the model
     and a few other metrics. The results are returned as a dict.
 
-    frozen_graph: GraphDef, a graph containing input node 'input' and outputs 'logits' and 'classes'
+    frozen_graph: GraphDef, a graph containing input node 'input' and outputs
+    'logits' and 'classes'
     model: string, the model name (see NETS table in graph.py)
     data_files: List of TFRecord files used for inference
     batch_size: int, batch size for TensorRT optimizations
     num_iterations: int, number of iterations(batches) to run for
-    num_warmup_iterations: int, number of iteration(batches) to exclude from benchmark measurments
+    num_warmup_iterations: int, number of iteration(batches) to exclude from
+                           benchmark measurments
     use_synthetic: bool, if true run using real data, otherwise synthetic
     display_every: int, print log every @display_every iteration
     run_calibration: bool, run using calibration or not (only int8 precision)
     mode: validation - using estimator.evaluate with accuracy measurments,
           benchmark - using estimator.predict
+
     """
-    # Define model function for tf.estimator.Estimator
+    # Define a model function for tf.estimator.Estimator.  Calculate loss as
+    # sparse softmax cross entropy between `logits' and `labels'.  Keep track of
+    # accuracy metrics under the variable scope `acc_op'.
     def model_fn(features, labels, mode):
         logits_out, classes_out = tf.import_graph_def(frozen_graph,
             input_map={'input': features},
@@ -355,15 +369,13 @@ def get_preprocess_fn(model, mode='validation'):
         input_width, input_height = net_def.get_input_dims()
         image = net_def.preprocess(image, input_width, input_height, is_training=False)
         return image
-    
+
     if mode == 'validation':
         return validation_process
     elif mode == 'benchmark':
         return benchmark_process
     else:
         raise ValueError("Mode must be either 'validation' or 'benchmark'")
-
-    
 
 def build_classification_graph(model, model_dir=None, default_models_dir='./data'):
     """Builds an image classification model by name
@@ -635,7 +647,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_iterations', type=int, default=None,
         help='How many iterations(batches) to evaluate. If not supplied, the whole set will be evaluated.')
     parser.add_argument('--display_every', type=int, default=100,
-        help='Number of iterations executed between two consecutive display of metrics')
+        help='Number of iterations executed between two consecutive displays of metrics')
     parser.add_argument('--use_synthetic', action='store_true',
         help='If set, one batch of random data is generated and used at every iteration.')
     parser.add_argument('--num_warmup_iterations', type=int, default=50,
@@ -677,7 +689,7 @@ if __name__ == '__main__':
 
     if args.mode == "validation":
         data_files = get_files(args.data_dir, 'validation*')
-    elif args.mode == "benchmark":    
+    elif args.mode == "benchmark":
         data_files = [os.path.join(path, name) for path, _, files in os.walk(args.data_dir) for name in files]
     else:
         raise ValueError("Mode must be either 'validation' or 'benchamark'")
