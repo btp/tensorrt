@@ -43,13 +43,12 @@ class LoggerHook(tf.train.SessionRunHook):
         self.num_steps = (num_records + batch_size - 1) / batch_size
         self.batch_size = batch_size
 
-    def begin(self):
+    def before_run(self, run_context):
         self.start_time = time.time()
 
     def after_run(self, run_context, run_values):
         current_time = time.time()
         duration = current_time - self.start_time
-        self.start_time = current_time
         self.iter_times.append(duration)
         current_step = len(self.iter_times)
         if current_step % self.display_every == 0:
@@ -72,13 +71,16 @@ class BenchmarkHook(tf.train.SessionRunHook):
     def before_run(self, run_context):
         if not self.start_time:
             self.start_time = time.time()
-            print("    running for target duration from %d", self.start_time)
+            if self.target_duration:
+                print("    running for target duration {} seconds from {}".format(
+                    self.target_duration, time.asctime(time.localtime(self.start_time))))
 
     def after_run(self, run_context, run_values):
         if self.target_duration:
             current_time = time.time()
             if (current_time - self.start_time) > self.target_duration:
-                print("    target duration %d reached at %d, requesting stop" % (self.target_duration, current_time))
+                print("    target duration {} reached at {}, requesting stop".format(
+                    self.target_duration), time.asctime(time.localtime(current_time)))
                 run_context.request_stop()
 
         if self.iteration_limit:
@@ -87,7 +89,7 @@ class BenchmarkHook(tf.train.SessionRunHook):
                 run_context.request_stop()
 
 def run(frozen_graph, model, data_files, batch_size,
-    num_iterations, num_warmup_iterations, use_synthetic, display_every=100, run_calibration=False,
+    num_iterations, num_warmup_iterations, use_synthetic, display_every=100,
     mode='validation', target_duration=None):
     """Evaluates a frozen graph
 
@@ -105,7 +107,6 @@ def run(frozen_graph, model, data_files, batch_size,
                            benchmark measurments
     use_synthetic: bool, if true run using real data, otherwise synthetic
     display_every: int, print log every @display_every iteration
-    run_calibration: bool, run using calibration or not (only int8 precision)
     mode: validation - using estimator.evaluate with accuracy measurments,
           benchmark - using estimator.predict
 
@@ -147,13 +148,14 @@ def run(frozen_graph, model, data_files, batch_size,
                 loc=112, scale=70,
                 size=(batch_size, input_height, input_width, 3)).astype(np.float32)
             features = np.clip(features, 0.0, 255.0)
-            features = tf.identity(tf.constant(features))
             labels = np.random.randint(
                 low=0,
                 high=get_netdef(model).get_num_classes(),
                 size=(batch_size),
                 dtype=np.int32)
-            labels = tf.identity(tf.constant(labels))
+            with tf.device('/device:GPU:0'):
+                features = tf.identity(tf.constant(features))
+                labels = tf.identity(tf.constant(labels))
         else:
             if mode == 'validation':
                 dataset = tf.data.TFRecordDataset(data_files)
@@ -179,7 +181,9 @@ def run(frozen_graph, model, data_files, batch_size,
         return features, labels
 
     # Evaluate model
-    if mode == 'validation':
+    if use_synthetic:
+        num_records = num_iterations * batch_size
+    elif mode == 'validation':
         num_records = get_tfrecords_count(data_files)
     elif mode == 'benchmark':
         num_records = len(data_files) 
@@ -209,6 +213,8 @@ def run(frozen_graph, model, data_files, batch_size,
     results['images_per_sec'] = np.mean(batch_size / iter_times)
     results['99th_percentile'] = np.percentile(iter_times, q=99, interpolation='lower') * 1000
     results['latency_mean'] = np.mean(iter_times) * 1000
+    results['latency_median'] = np.median(iter_times) * 1000
+    results['latency_min'] = np.min(iter_times) * 1000
     return results
 
 class NetDef(object):
@@ -523,6 +529,7 @@ def get_frozen_graph(
     model,
     model_dir=None,
     use_trt=False,
+    engine_dir=None,
     use_dynamic_op=False,
     precision='fp32',
     batch_size=8,
@@ -574,7 +581,7 @@ def get_frozen_graph(
             outputs=['logits', 'classes'],
             max_batch_size=batch_size,
             max_workspace_size_bytes=max_workspace_size,
-            precision_mode=precision,
+            precision_mode=precision.upper(),
             minimum_segment_size=minimum_segment_size,
             is_dynamic_op=use_dynamic_op
         )
@@ -583,6 +590,16 @@ def get_frozen_graph(
         num_nodes['trt_only'] = len([1 for n in frozen_graph.node if str(n.op)=='TRTEngineOp'])
         graph_sizes['trt'] = len(frozen_graph.SerializeToString())
 
+        if engine_dir:
+            segment_number = 0
+            for node in frozen_graph.node:
+                if node.op == "TRTEngineOp":
+                    engine = node.attr["serialized_segment"].s
+                    engine_path = engine_dir+'/{}_{}_{}_segment{}.trtengine'.format(model, precision, batch_size, segment_number)
+                    segment_number += 1
+                    with open(engine_path, "wb") as f:
+                        f.write(engine)
+
         if precision == 'int8':
             calib_graph = frozen_graph
             graph_sizes['calib'] = len(calib_graph.SerializeToString())
@@ -590,7 +607,7 @@ def get_frozen_graph(
             print('Calibrating INT8...')
             start_time = time.time()
             run(calib_graph, model, calib_files, batch_size,
-                num_calib_inputs // batch_size, 0, use_synthetic=use_synthetic, run_calibration=True)
+                num_calib_inputs // batch_size, 0, use_synthetic=use_synthetic)
             times['trt_calibration'] = time.time() - start_time
 
             start_time = time.time()
@@ -623,7 +640,7 @@ if __name__ == '__main__':
                  'resnet_v1_50', 'resnet_v2_50', 'resnet_v2_152', 'vgg_16', 'vgg_19',
                  'inception_v3', 'inception_v4'],
         help='Which model to use.')
-    parser.add_argument('--data_dir', type=str, required=True,
+    parser.add_argument('--data_dir', type=str, default=None,
         help='Directory containing validation set TFRecord files.')
     parser.add_argument('--calib_data_dir', type=str,
         help='Directory containing TFRecord files for calibrating int8.')
@@ -636,6 +653,9 @@ if __name__ == '__main__':
              'loaded from if --model_dir is not provided.')
     parser.add_argument('--use_trt', action='store_true',
         help='If set, the graph will be converted to a TensorRT graph.')
+    parser.add_argument('--engine_dir', type=str, default=None,
+        help='Directory where to write trt engines. Engines are written only if the directory ' \
+             'is provided. This option is ignored when not using tf_trt.')
     parser.add_argument('--use_trt_dynamic_op', action='store_true',
         help='If set, TRT conversion will be done using dynamic op instead of statically.')
     parser.add_argument('--precision', type=str, choices=['fp32', 'fp16', 'int8'], default='fp32',
@@ -677,6 +697,10 @@ if __name__ == '__main__':
             '({} <= {})'.format(args.num_calib_inputs, args.batch_size))
     if args.mode == 'validation' and args.use_synthetic:
         raise ValueError('Cannot use both validation mode and synthetic dataset')
+    if args.data_dir is None and not args.use_synthetic:
+        raise ValueError("--data_dir required if you are not using synthetic data")
+    if args.use_synthetic and args.num_iterations is None:
+        raise ValueError("--num_iterations is required for --use_synthetic")
 
     def get_files(data_dir, filename_pattern):
         if data_dir == None:
@@ -687,18 +711,22 @@ if __name__ == '__main__':
                              'pattern "{}"'.format(data_dir, filename_pattern))
         return files
 
-    if args.mode == "validation":
-        data_files = get_files(args.data_dir, 'validation*')
-    elif args.mode == "benchmark":
-        data_files = [os.path.join(path, name) for path, _, files in os.walk(args.data_dir) for name in files]
-    else:
-        raise ValueError("Mode must be either 'validation' or 'benchamark'")
-    calib_files = get_files(args.calib_data_dir, 'train*')
+    calib_files = []
+    data_files = []
+    if not args.use_synthetic:
+        if args.mode == "validation":
+            data_files = get_files(args.data_dir, 'validation*')
+        elif args.mode == "benchmark":    
+            data_files = [os.path.join(path, name) for path, _, files in os.walk(args.data_dir) for name in files]
+        else:
+            raise ValueError("Mode must be either 'validation' or 'benchamark'")
+        calib_files = get_files(args.calib_data_dir, 'train*')
 
     frozen_graph, num_nodes, times, graph_sizes = get_frozen_graph(
         model=args.model,
         model_dir=args.model_dir,
         use_trt=args.use_trt,
+        engine_dir=args.engine_dir,
         use_dynamic_op=args.use_trt_dynamic_op,
         precision=args.precision,
         batch_size=args.batch_size,
@@ -741,6 +769,8 @@ if __name__ == '__main__':
     if args.mode == 'validation':
         print('    accuracy: %.2f' % (results['accuracy'] * 100))
     print('    images/sec: %d' % results['images_per_sec'])
-    print('    99th_percentile(ms): %.1f' % results['99th_percentile'])
+    print('    99th_percentile(ms): %.2f' % results['99th_percentile'])
     print('    total_time(s): %.1f' % results['total_time'])
-    print('    latency_mean(ms): %.1f' % results['latency_mean'])
+    print('    latency_mean(ms): %.2f' % results['latency_mean'])
+    print('    latency_median(ms): %.2f' % results['latency_median'])
+    print('    latency_min(ms): %.2f' % results['latency_min'])
